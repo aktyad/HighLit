@@ -65,6 +65,13 @@ function uid(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
+function isSafeColor(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 256 || /\\|(?:url|var|env|attr)\s*\(/i.test(value)) return false
+  const style = document.createElement('span').style
+  style.color = value
+  return style.color !== ''
+}
+
 function hash(value: string): number {
   let result = 2166136261
   for (let i = 0; i < value.length; i++) {
@@ -428,7 +435,8 @@ export class HighLit {
       getItem: (key: string) => window.localStorage.getItem(key),
       setItem: (key: string, value: string) => window.localStorage.setItem(key, value),
     }
-    const colors = options.colors?.length ? options.colors : DEFAULT_COLORS
+    const validColors = options.colors?.filter(isSafeColor)
+    const colors = validColors?.length ? validColors : DEFAULT_COLORS
     const styles = options.styles?.length ? options.styles : DEFAULT_STYLES
     this.options = {
       pageKey: options.pageKey ?? window.location.pathname,
@@ -517,7 +525,7 @@ export class HighLit {
         ? value.filter((item): item is HighlightRecord => {
             if (!item || typeof item !== 'object') return false
             const record = item as Partial<HighlightRecord>
-            return typeof record.id === 'string' && typeof record.color === 'string' &&
+            return typeof record.id === 'string' && isSafeColor(record.color) &&
               typeof record.anchor?.exact === 'string' && record.anchor.exact.trim().length > 0 &&
               typeof record.anchor.prefix === 'string' && typeof record.anchor.suffix === 'string' &&
               Number.isSafeInteger(record.anchor.start) && Number.isSafeInteger(record.anchor.end) &&

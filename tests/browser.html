@@ -58,6 +58,18 @@
       }
     }
     status.textContent = 'Running…'
+    await check('CSS-hidden text is excluded from saved context', async (h, options) => {
+      stage.innerHTML = '<span style="display:none">SECRET BEFORE</span><p>Visible words</p><span style="visibility:hidden">SECRET AFTER</span>'
+      h.enable(); select(stage.querySelector('p')); await pause()
+      const saved = options.storage.getItem('')
+      assert(saved && saved.includes('Visible words') && !saved.includes('SECRET'), 'Hidden text leaked into saved context')
+    })
+    await check('Palette rejects resource URLs and CSS variables', async (h, options) => {
+      h.destroy()
+      const safe = createHighlit({ ...options, colors: ['url(/not-a-colour)', 'var(--paint)', '#f3cf4f'] })
+      try { assert(ui().querySelectorAll('.selection-swatch').length === 1, 'Unsafe paint accepted') }
+      finally { safe.destroy() }
+    })
     await check('Three wrapped lines animate immediately', async h => {
       stage.innerHTML = '<p>First selected line<br>Second selected line<br>Third selected line</p>'
       select(stage.querySelector('p')); await pause()

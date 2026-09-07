@@ -1,13 +1,15 @@
 {
   "name": "highlit-marker",
-  "version": "0.1.0",
-  "description": "A tiny, human-feeling text highlighter for any web page.",
+  "version": "0.1.1",
+  "description": "A drop-in text highlighter that feels like marking paper. Natural marker strokes, a colour picker, and local saving. Zero runtime dependencies.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/aktyad/HighLit.git"
   },
   "homepage": "https://github.com/aktyad/HighLit#readme",
-  "bugs": { "url": "https://github.com/aktyad/HighLit/issues" },
+  "bugs": {
+    "url": "https://github.com/aktyad/HighLit/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -30,6 +32,7 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "sideEffects": [
@@ -51,6 +54,9 @@
     "text-selection"
   ],
   "license": "MIT",
+  "overrides": {
+    "esbuild": "^0.28.1"
+  },
   "devDependencies": {
     "@types/node": "^24.3.0",
     "jsdom": "^26.1.0",

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Exclude CSS-hidden text from saved surrounding context.
+- Reject resource URLs and CSS indirection in configured and restored colours.
+- Update development tooling to a patched esbuild version.
+- Expand setup, API, privacy, integration, and troubleshooting documentation.
+- Remove the demo folder; retain the isolated browser regression page.
+
 ## 0.1.0
 
 Initial release of HighLit, a zero-runtime-dependency text highlighter.

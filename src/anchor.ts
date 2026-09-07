@@ -28,7 +28,7 @@ export function isHighlightableRange(range: Range, root: HTMLElement): boolean {
   const common = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
     ? range.commonAncestorContainer as Element
     : range.commonAncestorContainer.parentElement
-  if (!common || common.closest(EXCLUDED)) return false
+  if (!common || !isHighlightableNode(common)) return false
 
   return ![...common.querySelectorAll(EXCLUDED)].some((element) => {
     try {
@@ -45,22 +45,29 @@ export function isHighlightableNode(node: EventTarget | null): boolean {
     : node instanceof Node
       ? node.parentElement
       : null
-  return !element?.closest(EXCLUDED)
+  if (element?.closest(EXCLUDED)) return false
+  for (let current = element; current; current = current.parentElement) {
+    const style = current.ownerDocument.defaultView?.getComputedStyle(current)
+    if (style?.display === 'none' || style?.visibility === 'hidden' ||
+        style?.visibility === 'collapse' || style?.contentVisibility === 'hidden') return false
+  }
+  return true
 }
 
 function textEntries(root: HTMLElement): TextEntry[] {
   const view = root.ownerDocument.defaultView
   if (!view) return []
 
+  const eligible = new Map<Element, boolean>()
   const walker = root.ownerDocument.createTreeWalker(
     root,
     view.NodeFilter.SHOW_TEXT,
     {
       acceptNode(node) {
         const parent = (node as Text).parentElement
-        return parent?.closest(EXCLUDED)
-          ? view.NodeFilter.FILTER_REJECT
-          : view.NodeFilter.FILTER_ACCEPT
+        if (!parent) return view.NodeFilter.FILTER_REJECT
+        if (!eligible.has(parent)) eligible.set(parent, isHighlightableNode(parent))
+        return eligible.get(parent) ? view.NodeFilter.FILTER_ACCEPT : view.NodeFilter.FILTER_REJECT
       },
     },
   )

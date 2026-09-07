@@ -13,6 +13,15 @@ afterEach(() => {
 })
 
 describe('text anchoring', () => {
+  it('does not save CSS-hidden text in surrounding anchor context', () => {
+    document.body.innerHTML = '<style>.secret { display: none }</style><main><span class="secret">SECRET BEFORE</span><p>Visible text</p><span style="visibility:hidden">SECRET AFTER</span></main>'
+    const root = document.querySelector('main')!
+    const range = document.createRange()
+    range.selectNodeContents(root.querySelector('p')!)
+    expect(createAnchor(range, root)).toEqual({ exact: 'Visible text', prefix: '', suffix: '', start: 0, end: 12 })
+    range.selectNodeContents(root.querySelector('.secret')!)
+    expect(createAnchor(range, root)).toBeNull()
+  })
   it('restores a selection after surrounding markup changes', () => {
     document.body.innerHTML = '<main>Read <strong>this useful sentence</strong> today.</main>'
     const root = document.querySelector('main')!
@@ -120,6 +129,26 @@ describe('highlight actions', () => {
 })
 
 describe('highlighter flow', () => {
+  it('rejects resource URLs and CSS indirection in palette and stored colours', () => {
+    document.body.innerHTML = '<main>Saved text</main>'
+    const unsafe = ['url(https://example.invalid/pixel)', 'var(--remote-paint)', 'u\\72l(https://example.invalid/pixel)',
+      'red; background: url(https://example.invalid/pixel)', '<img src=x onerror=alert(1)>']
+    localStorage.setItem('highlit:unsafe-colours', JSON.stringify(unsafe.map((color, index) => ({
+      id: String(index), color, anchor: { exact: 'Saved text', prefix: '', suffix: '', start: 0, end: 10 },
+    }))))
+    const highlit = createHighlit({ pageKey: 'unsafe-colours', colors: [...unsafe, '#ffcc00', 'red', 'rgb(1, 2, 3)'] })
+    try {
+      const shadow = document.querySelector('div[data-highlit-ui]')!.shadowRoot!
+      expect([...shadow.querySelectorAll('.selection-swatch')].map(button => (button as HTMLElement).dataset.color))
+        .toEqual(['#ffcc00', 'red', 'rgb(1, 2, 3)'])
+      expect(document.querySelector('svg[data-highlit-ui] path')).toBeNull()
+      expect(shadow.querySelector('[onerror]')).toBeNull()
+    } finally { highlit.destroy() }
+    const fallback = createHighlit({ colors: unsafe })
+    expect(document.querySelector('div[data-highlit-ui]')!.shadowRoot!.querySelectorAll('.selection-swatch')).toHaveLength(6)
+    fallback.destroy()
+  })
+
   it.each([3, 4])('limits animation for a %i-line selection', async (lines) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame', 'performance'] })
     document.body.innerHTML = '<main>Several lines of selected text</main>'
