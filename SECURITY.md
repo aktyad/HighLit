@@ -67,8 +67,8 @@ the runtime and development tree before a release.
 
 Do not post credentials, private highlight text, or exploits against someone
 else's site publicly. Use a minimal example with synthetic text and contact the
-maintainer through a private channel you already have access to. The repository
-is currently private; a public vulnerability-reporting channel is not configured.
+maintainer through [GitHub private vulnerability reporting](https://github.com/aktyad/HighLit/security/advisories/new).
+Include the affected version, a minimal reproduction, and the expected impact.
 
 ## References
 

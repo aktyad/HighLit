@@ -92,9 +92,9 @@ were not printed or inspected.
   static HTML template. Do not weaken host policies without an integration review.
 - Browser-specific behaviour, unusual overlays, CSS-only hiding techniques beyond
   those explicitly checked, and assistive-technology support need further testing.
-- The GitHub repository remains private, so npm repository/support links are not
-  useful to unauthenticated readers. A publicly accessible confidential-reporting channel is not
-  configured; the maintainer should choose a contact channel before promoting it.
+- The repository was subsequently made public after rechecking all reachable
+  history and release archives for credential patterns and sensitive configuration
+  paths. No matches were found. GitHub private vulnerability reporting is enabled.
 
 ## Release status
 
