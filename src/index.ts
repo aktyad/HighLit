@@ -1,14 +1,17 @@
-import { createAnchor, resolveAnchor, type TextAnchor } from './anchor'
+import { createAnchor, createTextIndex, isHighlightableNode, isHighlightableRange, resolveAnchor, type TextAnchor } from './anchor'
 import deleteImage from './assets/highlit-delete.svg'
-import selectionMenuImage from './assets/highlit-selection-menu.svg'
 
 export const DEFAULT_COLORS = [
-  '#fff214',
-  '#5cff32',
-  '#38c8f4',
-  '#ff4fa3',
-  '#ff8a1f',
+  '#756257',
+  '#2bc96a',
+  '#53c8e5',
+  '#a178e4',
+  '#f24043',
+  '#f3cf4f',
 ] as const
+
+export type HighlighterStyle = 'chisel' | 'round' | 'brush'
+export const DEFAULT_STYLES: readonly HighlighterStyle[] = ['chisel']
 
 export interface HighLitStorage {
   getItem(key: string): string | null
@@ -20,6 +23,8 @@ export interface HighLitOptions {
   pageKey?: string
   /** Highlight colours shown in the picker. */
   colors?: readonly string[]
+  /** Marker tips; the first entry determines the stroke style. */
+  styles?: readonly HighlighterStyle[]
   /** Element whose text can be highlighted. Defaults to document.body. */
   root?: HTMLElement
   /** Storage implementation. Defaults to localStorage. */
@@ -29,8 +34,10 @@ export interface HighLitOptions {
 interface HighlightRecord {
   id: string
   color: string
+  style?: HighlighterStyle
   anchor: TextAnchor
   pressure?: number
+  createdAt?: number
 }
 
 interface RenderedHighlight {
@@ -39,6 +46,20 @@ interface RenderedHighlight {
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg'
+const INK_OPACITY = 0.72
+// Sweep each line, briefly hold the wet ink, then let it settle.
+const INK_TIMING = { minSweep: 340, maxSweep: 880, wetHold: 250, dry: 1050 } as const
+const WET_INK_BOOST = 0.45
+const MAX_ANIMATED_LINES = 3
+const MAX_ANIMATION_MS = 5000
+
+function lineTiming(width: number, seed: string) {
+  const pace = (0.55 + (hash(`${seed}:pace`) % 35) / 100) * 1.25
+  return {
+    sweep: Math.min(INK_TIMING.maxSweep, Math.max(INK_TIMING.minSweep, width / pace)),
+    pause: 55 + hash(`${seed}:pause`) % 65,
+  }
+}
 
 function uid(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -96,8 +117,6 @@ interface StrokeShape {
   d: string
   startDeposit: string
   endDeposit: string
-  grain: string
-  grainWidth: number
   left: number
   right: number
   top: number
@@ -115,6 +134,113 @@ function normalizePressure(value: unknown): number {
     : 0.5
 }
 
+/** Maps clock time to uneven, always-forward hand movement. */
+export function humanRevealProgress(value: number, seedValue: string): number {
+  const progress = Math.min(1, Math.max(0, value))
+  if (progress === 0 || progress === 1) return progress
+
+  const jitter = random(hash(seedValue))
+  const segments = [
+    { time: 0.14, speed: 0.55 + jitter() * 0.25 },
+    { time: 0.26, speed: 1.05 + jitter() * 0.4 },
+    { time: 0.32, speed: 0.72 + jitter() * 0.48 },
+    { time: 0.28, speed: 0.6 + jitter() * 0.3 },
+  ]
+  const distance = segments.reduce((total, segment) => total + segment.time * segment.speed, 0)
+  let elapsed = 0
+  let travelled = 0
+  for (const segment of segments) {
+    if (progress <= elapsed + segment.time) {
+      return (travelled + (progress - elapsed) * segment.speed) / distance
+    }
+    elapsed += segment.time
+    travelled += segment.time * segment.speed
+  }
+  return 1
+}
+
+function rangeClientRects(range: Range, visibleOnly = true): DOMRect[] {
+  const owner = range.startContainer.ownerDocument ?? document
+  const root = range.commonAncestorContainer
+  const texts: Text[] = []
+  if (root.nodeType === Node.TEXT_NODE) {
+    texts.push(root as Text)
+  } else {
+    const walker = owner.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+    let node: Node | null
+    while ((node = walker.nextNode())) texts.push(node as Text)
+  }
+
+  const rects = texts.flatMap((text) => {
+    if (!isHighlightableNode(text)) return []
+    try {
+      if (!range.intersectsNode(text)) return []
+    } catch {
+      return []
+    }
+
+    const start = text === range.startContainer ? range.startOffset : 0
+    const end = text === range.endContainer ? range.endOffset : text.length
+    if (start >= end || !text.data.slice(start, end).trim()) return []
+
+    const textRange = owner.createRange()
+    textRange.setStart(text, start)
+    textRange.setEnd(text, end)
+    return [...textRange.getClientRects()].filter((rect) =>
+      rect.width > 0 && rect.height > 0 && (!visibleOnly || isUncovered(rect, text.parentElement!)),
+    )
+  })
+
+  return rects.filter((rect, index) => !rects.some((other, otherIndex) =>
+    index !== otherIndex &&
+    rect.width * rect.height > other.width * other.height * 2 &&
+    rect.left <= other.left && rect.top <= other.top &&
+    rect.right >= other.right && rect.bottom >= other.bottom,
+  ))
+}
+
+// Be conservative: hide an obscured line instead of painting over a site's UI.
+function isUncovered(rect: DOMRect, source: Element): boolean {
+  if (!document.elementsFromPoint) return true
+  for (const x of [rect.left + 1, (rect.left + rect.right) / 2, rect.right - 1]) {
+    for (const y of [rect.top + 1, (rect.top + rect.bottom) / 2, rect.bottom - 1]) {
+      const top = document.elementsFromPoint(x, y)
+        .find((element) => !element.closest('[data-highlit-ui]'))
+      if (!top || !isHighlightableNode(top) || top !== source) return false
+    }
+  }
+  return true
+}
+
+function colorLuminance(value: string): { luminance: number; alpha: number } | undefined {
+  const values = value.match(/[\d.]+/g)?.map(Number)
+  if (!values || values.length < 3) return undefined
+  const channels = values.slice(0, 3).map((channel) => {
+    const value = channel! / 255
+    return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4)
+  })
+  return {
+    luminance: channels[0]! * 0.2126 + channels[1]! * 0.7152 + channels[2]! * 0.0722,
+    alpha: values[3] ?? 1,
+  }
+}
+
+function markerBlendMode(range: Range): 'multiply' | 'screen' {
+  const element = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? range.startContainer as Element
+    : range.startContainer.parentElement
+  if (!element) return 'multiply'
+
+  const foreground = colorLuminance(getComputedStyle(element).color)?.luminance
+  for (let current: Element | null = element; current; current = current.parentElement) {
+    const background = colorLuminance(getComputedStyle(current).backgroundColor)
+    if (background && background.alpha >= 0.85) {
+      return foreground !== undefined && foreground > background.luminance ? 'screen' : 'multiply'
+    }
+  }
+  return foreground !== undefined && foreground > 0.35 ? 'screen' : 'multiply'
+}
+
 function mergeLineRects(rects: StrokeRect[]): StrokeRect[] {
   const sorted = [...rects].sort((a, b) => a.y - b.y || a.x - b.x)
   const merged: StrokeRect[] = []
@@ -127,13 +253,18 @@ function mergeLineRects(rects: StrokeRect[]): StrokeRect[] {
       previous.width = right - previous.x
       previous.height = Math.max(previous.height, rect.height)
     } else {
-      merged.push({ ...rect })
+      merged.push({ x: rect.x, y: rect.y, width: rect.width, height: rect.height })
     }
   }
   return merged
 }
 
-function buildStrokeShapes(rects: StrokeRect[], seedValue: string, pressureValue = 0.5): StrokeShape[] {
+function buildStrokeShapes(
+  rects: StrokeRect[],
+  seedValue: string,
+  pressureValue = 0.5,
+  style: HighlighterStyle = 'chisel',
+): StrokeShape[] {
   const pressure = normalizePressure(pressureValue)
   const spread = (pressure - 0.5) * 2
   const bands = mergeLineRects(rects).map((rect) => ({
@@ -143,22 +274,9 @@ function buildStrokeShapes(rects: StrokeRect[], seedValue: string, pressureValue
     bottom: rect.y + rect.height * 0.94 + 1.5 + spread,
   }))
 
-  // Wrapped lines share a little paint where their horizontal spans overlap.
-  for (let line = 1; line < bands.length; line++) {
-    const previous = bands[line - 1]!
-    const current = bands[line]!
-    const gap = current.top - previous.bottom
-    const overlap = Math.min(previous.right, current.right) - Math.max(previous.left, current.left)
-    if (gap > 0 && gap < 14 && overlap > 3) {
-      const join = (previous.bottom + current.top) / 2
-      previous.bottom = join + 0.8
-      current.top = join - 0.8
-    }
-  }
-
   return bands.map((band, line) => {
     const rand = random(hash(`${seedValue}-${line}`))
-    const jitter = (amount = 1.4) => (rand() - 0.5) * amount * 2
+    const jitter = (amount = 1) => (rand() - 0.5) * amount * 2
     const left = band.left - rand() * 1.5
     const right = band.right + rand() * 1.5
     const top = band.top
@@ -166,19 +284,36 @@ function buildStrokeShapes(rects: StrokeRect[], seedValue: string, pressureValue
     const quarter = (right - left) / 4
     const middle = (top + bottom) / 2
 
-    const d = [
-      `M ${left + 1} ${top + jitter()}`,
-      `C ${left - 1.5} ${top + 2}, ${left - 2} ${middle - 2}, ${left} ${bottom + jitter()}`,
-      `L ${left + quarter} ${bottom + jitter()}`,
-      `L ${left + quarter * 2} ${bottom + jitter()}`,
-      `L ${left + quarter * 3} ${bottom + jitter()}`,
-      `L ${right - 1} ${bottom + jitter()}`,
-      `Q ${right + 2.5} ${middle}, ${right} ${top + jitter()}`,
-      `L ${left + quarter * 3} ${top + jitter()}`,
-      `L ${left + quarter * 2} ${top + jitter()}`,
-      `L ${left + quarter} ${top + jitter()}`,
-      'Z',
-    ].join(' ')
+    const d = style === 'round'
+      ? [
+          `M ${left + 2} ${top + jitter(0.8)}`,
+          `Q ${left - 3} ${middle}, ${left + 1} ${bottom + jitter(0.8)}`,
+          `C ${left + quarter} ${bottom + jitter(0.7)}, ${right - quarter} ${bottom + jitter(0.7)}, ${right - 1} ${bottom + jitter(0.8)}`,
+          `Q ${right + 3} ${middle}, ${right - 1} ${top + jitter(0.8)}`,
+          `C ${right - quarter} ${top + jitter(0.7)}, ${left + quarter} ${top + jitter(0.7)}, ${left + 2} ${top + jitter(0.8)}`,
+          'Z',
+        ].join(' ')
+      : style === 'brush'
+        ? [
+            `M ${left + 1} ${top + jitter()}`,
+            `C ${left - 2} ${top + 2}, ${left - 2} ${middle - 2}, ${left} ${bottom + jitter()}`,
+            `C ${left + quarter} ${bottom + jitter()}, ${right - quarter} ${bottom - 1 + jitter()}, ${right + 2} ${middle + jitter(0.8)}`,
+            `C ${right - quarter} ${top + 1 + jitter()}, ${left + quarter} ${top + jitter()}, ${left + 1} ${top + jitter()}`,
+            'Z',
+          ].join(' ')
+        : [
+            `M ${left + 1} ${top + jitter()}`,
+            `C ${left - 1.5} ${top + 2}, ${left - 2} ${middle - 2}, ${left} ${bottom + jitter()}`,
+            `L ${left + quarter} ${bottom + jitter()}`,
+            `L ${left + quarter * 2} ${bottom + jitter()}`,
+            `L ${left + quarter * 3} ${bottom + jitter()}`,
+            `L ${right - 1} ${bottom + jitter()}`,
+            `Q ${right + 2.5} ${middle}, ${right} ${top + jitter()}`,
+            `L ${left + quarter * 3} ${top + jitter()}`,
+            `L ${left + quarter * 2} ${top + jitter()}`,
+            `L ${left + quarter} ${top + jitter()}`,
+            'Z',
+          ].join(' ')
 
     const startWidth = Math.min(11, Math.max(4.5, (right - left) * 0.075))
     const endWidth = Math.min(7, Math.max(3, (right - left) * 0.045))
@@ -198,19 +333,11 @@ function buildStrokeShapes(rects: StrokeRect[], seedValue: string, pressureValue
       `L ${right - endWidth * 0.8} ${bottom + jitter(0.7)}`,
       'Z',
     ].join(' ')
-    const grain = [
-      `M ${left + startWidth * 0.6} ${top + 2 + jitter(0.45)}`,
-      `C ${left + quarter} ${top + 1.6 + jitter(0.4)}, ${left + quarter * 3} ${top + 2.4 + jitter(0.4)}, ${right - endWidth} ${top + 2 + jitter(0.45)}`,
-      `M ${left + startWidth * 0.7} ${bottom - 2.2 + jitter(0.4)}`,
-      `C ${left + quarter} ${bottom - 1.8 + jitter(0.4)}, ${left + quarter * 3} ${bottom - 2.5 + jitter(0.4)}, ${right - endWidth} ${bottom - 2.1 + jitter(0.4)}`,
-    ].join(' ')
 
     return {
       d,
       startDeposit,
       endDeposit,
-      grain,
-      grainWidth: Math.min(1.15, Math.max(0.65, (bottom - top) * 0.045)),
       left,
       right,
       top,
@@ -220,27 +347,66 @@ function buildStrokeShapes(rects: StrokeRect[], seedValue: string, pressureValue
 }
 
 /** Builds stable, slightly imperfect marker strokes from browser line boxes. */
-export function buildStrokePaths(rects: StrokeRect[], seedValue: string, pressure = 0.5): string[] {
-  return buildStrokeShapes(rects, seedValue, pressure).map(({ d }) => d)
+export function buildStrokePaths(
+  rects: StrokeRect[],
+  seedValue: string,
+  pressure = 0.5,
+  style: HighlighterStyle = 'chisel',
+): string[] {
+  return buildStrokeShapes(rects, seedValue, pressure, style).map(({ d }) => d)
 }
 
-export function buildStrokePath(rects: StrokeRect[], seedValue: string, pressure = 0.5): string {
-  return buildStrokePaths(rects, seedValue, pressure).join(' ')
+export function buildStrokePath(
+  rects: StrokeRect[],
+  seedValue: string,
+  pressure = 0.5,
+  style: HighlighterStyle = 'chisel',
+): string {
+  return buildStrokePaths(rects, seedValue, pressure, style).join(' ')
+}
+
+export function positionPopover(
+  rects: Array<Pick<DOMRect, 'left' | 'top' | 'bottom' | 'width'>>,
+  viewportWidth: number,
+  viewportHeight: number,
+): { left: number; top: number } {
+  const size = 38
+  const gap = 8
+  const margin = 8
+  const visible = rects.filter((rect) => rect.bottom > margin && rect.top < viewportHeight - margin)
+  const first = visible[0] ?? rects[0]
+  const last = visible[visible.length - 1] ?? rects[rects.length - 1] ?? first
+  if (!first || !last) return { left: margin, top: margin }
+
+  const above = first.top - gap - size
+  const below = last.bottom + gap
+  const placeBelow = above < margin && (
+    below + size <= viewportHeight - margin || viewportHeight - last.bottom > first.top
+  )
+  const anchor = placeBelow ? last : first
+  const maxLeft = Math.max(margin, viewportWidth - margin - size)
+  const maxTop = Math.max(margin, viewportHeight - margin - size)
+  return {
+    left: Math.min(maxLeft, Math.max(margin, anchor.left + anchor.width / 2 - size / 2)),
+    top: Math.min(maxTop, Math.max(margin, placeBelow ? below : above)),
+  }
 }
 
 export class HighLit {
-  private readonly options: Required<Pick<HighLitOptions, 'pageKey' | 'colors' | 'root' | 'storage'>>
+  private readonly options: Required<Pick<HighLitOptions, 'pageKey' | 'colors' | 'styles' | 'root' | 'storage'>>
   private readonly storageKey: string
   private records: HighlightRecord[] = []
   private rendered: RenderedHighlight[] = []
   private revealStarts = new Map<string, number>()
   private active = false
   private selectedColor: string
+  private selectedStyle: HighlighterStyle
   private mounted = false
   private frame = 0
   private captureTimer = 0
   private selectionMenuTimer = 0
   private pointerSelecting = false
+  private pointerIgnored = false
   private pressureTotal = 0
   private pressureSamples = 0
   private previewId?: string
@@ -253,19 +419,27 @@ export class HighLit {
   private pendingSelection?: Range
   private pendingDelete?: string
   private observer?: MutationObserver
+  private readonly customStorage: boolean
 
   constructor(options: HighLitOptions = {}) {
+    this.customStorage = options.storage !== undefined
     const root = options.root ?? document.body
-    const storage = options.storage ?? window.localStorage
+    const storage = options.storage ?? {
+      getItem: (key: string) => window.localStorage.getItem(key),
+      setItem: (key: string, value: string) => window.localStorage.setItem(key, value),
+    }
     const colors = options.colors?.length ? options.colors : DEFAULT_COLORS
+    const styles = options.styles?.length ? options.styles : DEFAULT_STYLES
     this.options = {
       pageKey: options.pageKey ?? window.location.pathname,
       colors,
+      styles,
       root,
       storage,
     }
     this.storageKey = `highlit:${this.options.pageKey}`
     this.selectedColor = colors[0] ?? '#fff214'
+    this.selectedStyle = styles[0] ?? 'chisel'
   }
 
   mount(): this {
@@ -275,6 +449,7 @@ export class HighLit {
     this.createOverlay()
     this.createControls()
     this.bind()
+    this.options.root.toggleAttribute('data-highlit-active', this.active)
     this.render()
     return this
   }
@@ -282,6 +457,11 @@ export class HighLit {
   destroy(): void {
     if (!this.mounted) return
     this.mounted = false
+    this.clearPreview()
+    this.hideSelectionMenu()
+    this.hideDelete()
+    this.pointerSelecting = false
+    this.pointerIgnored = false
     cancelAnimationFrame(this.frame)
     window.clearTimeout(this.captureTimer)
     window.clearTimeout(this.selectionMenuTimer)
@@ -292,13 +472,17 @@ export class HighLit {
     document.removeEventListener('selectionchange', this.onSelectionChange)
     document.removeEventListener('click', this.onDocumentClick, true)
     document.removeEventListener('keydown', this.onKeyDown, true)
-    window.removeEventListener('resize', this.scheduleRender)
-    window.removeEventListener('scroll', this.scheduleRender, true)
+    window.removeEventListener('resize', this.onViewportChange)
+    window.removeEventListener('scroll', this.onViewportChange, true)
     window.removeEventListener('storage', this.onStorage)
+    document.removeEventListener('toggle', this.onViewportChange, true)
+    document.removeEventListener('transitionend', this.onViewportChange, true)
+    document.removeEventListener('animationend', this.onViewportChange, true)
     this.options.root.removeEventListener('webkitmouseforcewillbegin', this.onForceWillBegin, true)
     this.options.root.removeEventListener('webkitmouseforcechanged', this.onForceChange, true)
     this.overlay?.remove()
     this.host?.remove()
+    this.rendered = []
     this.revealStarts.clear()
     this.options.root.removeAttribute('data-highlit-active')
   }
@@ -312,6 +496,13 @@ export class HighLit {
   }
 
   clear(): void {
+    window.clearTimeout(this.captureTimer)
+    this.hideSelectionMenu()
+    this.clearPreview()
+    const selection = document.getSelection()
+    if (selection?.rangeCount && this.options.root.contains(selection.getRangeAt(0).commonAncestorContainer)) {
+      selection.removeAllRanges()
+    }
     this.records = []
     this.revealStarts.clear()
     this.write()
@@ -327,8 +518,12 @@ export class HighLit {
             if (!item || typeof item !== 'object') return false
             const record = item as Partial<HighlightRecord>
             return typeof record.id === 'string' && typeof record.color === 'string' &&
-              typeof record.anchor?.exact === 'string' &&
-              Number.isFinite(record.anchor.start) && Number.isFinite(record.anchor.end)
+              typeof record.anchor?.exact === 'string' && record.anchor.exact.trim().length > 0 &&
+              typeof record.anchor.prefix === 'string' && typeof record.anchor.suffix === 'string' &&
+              Number.isSafeInteger(record.anchor.start) && Number.isSafeInteger(record.anchor.end) &&
+              record.anchor.start >= 0 && record.anchor.end > record.anchor.start &&
+              (record.pressure === undefined || (typeof record.pressure === 'number' && Number.isFinite(record.pressure))) &&
+              (record.style === undefined || ['chisel', 'round', 'brush'].includes(record.style))
           })
         : []
     } catch {
@@ -355,7 +550,7 @@ export class HighLit {
       height: '100vh',
       overflow: 'visible',
       pointerEvents: 'none',
-      zIndex: '2147483645',
+      zIndex: '1',
     })
     document.body.append(overlay)
     this.overlay = overlay
@@ -370,7 +565,7 @@ export class HighLit {
       inset: '0',
       width: '0',
       height: '0',
-      zIndex: '2147483647',
+      zIndex: '2',
       pointerEvents: 'none',
     })
 
@@ -384,51 +579,35 @@ export class HighLit {
           outline: 2px solid #111; outline-offset: 2px;
         }
         .selection-menu {
-          position: fixed; display: block; width: 130px; height: 42px; border-radius: 21px;
-          background: rgba(255,255,255,.001); isolation: isolate; overflow: visible;
-          -webkit-backdrop-filter: blur(3px) saturate(1.08);
-          backdrop-filter: blur(3px) saturate(1.08);
+          position: fixed; display: flex; gap: 4px; align-items: center; width: max-content;
+          padding: 4px; border: 1px solid #e8e8e8; border-radius: 999px; background: #fff;
+          box-shadow: 0 6px 12px rgba(50,50,93,.25), 0 3px 7px rgba(0,0,0,.3);
           transform: translateX(-50%); pointer-events: auto;
         }
         .selection-menu[hidden] { display: none; }
-        .selection-menu-image {
-          position: absolute; z-index: 1; left: -3.164px; top: -3.692px;
-          display: block; width: 153.908px; height: 65.908px; max-width: none;
-          pointer-events: none;
-        }
         .selection-swatch {
-          position: absolute; z-index: 2; top: 9px; width: 24px; height: 24px; padding: 0;
-          border: 1.412px solid transparent; border-radius: 50%;
-          background:
-            linear-gradient(var(--color), var(--color)) padding-box,
-            linear-gradient(145deg, rgba(255,255,255,.9), rgba(255,255,255,.28) 52%, rgba(255,255,255,.68)) border-box;
-          box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 2px rgba(34,29,26,.08);
-          cursor: pointer; transform: translateY(0) scale(1); transform-origin: center;
-          transition: transform 180ms cubic-bezier(.2,1.35,.3,1), filter 130ms ease, box-shadow 180ms ease;
+          flex: 0 0 auto; width: 27px; height: 27px; padding: 0;
+          border: 0; border-radius: 50%; background: var(--color); cursor: pointer;
+          transition: box-shadow 120ms ease, transform 120ms ease;
         }
-        .selection-swatch:is(:hover, :focus-visible) {
-          z-index: 8; transform: translateY(-4px) scale(1.1); filter: brightness(1.05) saturate(1.03);
-          box-shadow: inset 0 1px 0 rgba(255,255,255,.28), 0 5px 8px rgba(34,29,26,.12);
-        }
-        .selection-swatch:active { transform: translateY(-2px) scale(1.06); }
+        .selection-swatch:hover { box-shadow: inset 0 0 0 2px #fff; }
+        .selection-swatch:active { transform: scale(.94); }
         .delete {
-          position: fixed; display: none; width: 34px; height: 34px; padding: 8px;
-          border: 1px solid #e1e1e1; border-radius: 51px;
-          background: rgba(255,255,255,.32);
-          -webkit-backdrop-filter: blur(3px) saturate(1.08); backdrop-filter: blur(3px) saturate(1.08);
-          box-shadow: 8.79px 8.262px 11.954px rgba(0,0,0,.04);
+          position: fixed; display: none; width: 38px; height: 38px; padding: 8px;
+          border: 1px solid rgba(0,0,0,.1); border-radius: 50%;
+          background: #fff;
           cursor: pointer; pointer-events: auto;
         }
         .delete[data-open] { display: grid; place-items: center; }
-        .delete-image { display: block; width: 16px; height: 16px; max-width: none; pointer-events: none; }
+        .delete:hover { background: #f7f7f7; }
+        .delete:focus-visible { outline: 2px solid #111; outline-offset: 2px; }
+        .delete-image { display: block; width: 20px; height: 20px; max-width: none; pointer-events: none; }
         @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
       </style>
       <button class="delete" type="button" aria-label="Remove highlight">
-        <img class="delete-image" width="16" height="16" alt="" aria-hidden="true">
+        <img class="delete-image" width="20" height="20" alt="" aria-hidden="true">
       </button>
-      <div class="selection-menu" role="toolbar" aria-label="Highlight selection" hidden>
-        <img class="selection-menu-image" alt="" aria-hidden="true">
-      </div>`
+      <div class="selection-menu" role="toolbar" aria-label="Choose a highlight colour" hidden></div>`
 
     const deleteButton = shadow.querySelector<HTMLButtonElement>('.delete')!
     deleteButton.addEventListener('click', () => {
@@ -446,18 +625,14 @@ export class HighLit {
     this.deleteButton = deleteButton
     this.selectionMenu = shadow.querySelector<HTMLDivElement>('.selection-menu')!
     shadow.querySelector<HTMLImageElement>('.delete-image')!.src = deleteImage
-    shadow.querySelector<HTMLImageElement>('.selection-menu-image')!.src = selectionMenuImage
-    const selectionColors = Array.from(
-      { length: 5 },
-      (_, index) => this.options.colors[index % this.options.colors.length]!,
-    )
+    const selectionColors = this.options.colors.slice(0, 6)
     selectionColors.forEach((color, index) => {
       const swatch = document.createElement('button')
       swatch.className = 'selection-swatch'
       swatch.type = 'button'
+      swatch.dataset.color = color.toLowerCase()
       swatch.setAttribute('aria-label', `Highlight with colour ${index + 1}`)
       swatch.style.setProperty('--color', color)
-      swatch.style.left = `${13 + index * 20}px`
       swatch.addEventListener('pointerdown', (event) => event.preventDefault())
       swatch.addEventListener('click', () => this.highlightPendingSelection(color))
       this.selectionMenu!.append(swatch)
@@ -471,9 +646,12 @@ export class HighLit {
     document.addEventListener('selectionchange', this.onSelectionChange)
     document.addEventListener('click', this.onDocumentClick, true)
     document.addEventListener('keydown', this.onKeyDown, true)
-    window.addEventListener('resize', this.scheduleRender)
-    window.addEventListener('scroll', this.scheduleRender, true)
+    window.addEventListener('resize', this.onViewportChange)
+    window.addEventListener('scroll', this.onViewportChange, true)
     window.addEventListener('storage', this.onStorage)
+    document.addEventListener('toggle', this.onViewportChange, true)
+    document.addEventListener('transitionend', this.onViewportChange, true)
+    document.addEventListener('animationend', this.onViewportChange, true)
     this.options.root.addEventListener('webkitmouseforcewillbegin', this.onForceWillBegin, true)
     this.options.root.addEventListener('webkitmouseforcechanged', this.onForceChange, true)
 
@@ -486,10 +664,14 @@ export class HighLit {
       })
       if (pageChanged) this.scheduleRender()
     })
-    this.observer.observe(this.options.root, { subtree: true, childList: true, characterData: true })
+    this.observer.observe(document.body, {
+      subtree: true, childList: true, characterData: true, attributes: true,
+      attributeFilter: ['class', 'style', 'open', 'hidden', 'inert', 'aria-hidden', 'aria-modal'],
+    })
   }
 
   private setActive(active: boolean): void {
+    window.clearTimeout(this.captureTimer)
     this.active = active
     this.pointerSelecting = false
     this.resetPressure()
@@ -501,6 +683,13 @@ export class HighLit {
 
   private onPointerDown = (event: PointerEvent): void => {
     if (event.composedPath().includes(this.host as EventTarget)) return
+    this.pointerIgnored = !isHighlightableNode(event.target)
+    if (this.pointerIgnored) {
+      this.pointerSelecting = false
+      this.hideSelectionMenu()
+      if (this.active) this.clearPreview()
+      return
+    }
     this.pointerSelecting = true
     this.hideSelectionMenu()
     if (!this.active) return
@@ -516,7 +705,7 @@ export class HighLit {
   }
 
   private onForceWillBegin: EventListener = (event) => {
-    if (this.active) event.preventDefault()
+    if (this.active && isHighlightableNode(event.target)) event.preventDefault()
   }
 
   private onForceChange: EventListener = (event) => {
@@ -544,8 +733,15 @@ export class HighLit {
   }
 
   private onPointerUp = (event: PointerEvent): void => {
+    const pointerIgnored = this.pointerIgnored || !isHighlightableNode(event.target)
     this.pointerSelecting = false
+    this.pointerIgnored = false
     if (event.composedPath().includes(this.host as EventTarget)) return
+    if (pointerIgnored) {
+      this.hideSelectionMenu()
+      if (this.active) this.clearPreview()
+      return
+    }
     if (!this.active) {
       this.scheduleSelectionMenu(0)
       return
@@ -568,7 +764,7 @@ export class HighLit {
 
     this.hideSelectionMenu()
 
-    if (range && this.options.root.contains(range.commonAncestorContainer)) {
+    if (range && isHighlightableRange(range, this.options.root)) {
       this.previewId ??= uid()
       this.previewRange = range.cloneRange()
       this.scheduleRender()
@@ -590,7 +786,7 @@ export class HighLit {
       return
     }
     const range = selection.getRangeAt(0)
-    if (!this.saveRange(range, this.selectedColor, this.currentPressure(), this.previewId ?? uid())) {
+    if (!this.saveRange(range, this.selectedColor, this.currentPressure(), this.previewId ?? uid(), this.selectedStyle)) {
       this.clearPreview()
       return
     }
@@ -601,7 +797,13 @@ export class HighLit {
     this.render()
   }
 
-  private saveRange(range: Range, color: string, pressure: number, id = uid()): boolean {
+  private saveRange(
+    range: Range,
+    color: string,
+    pressure: number,
+    id = uid(),
+    style: HighlighterStyle = this.selectedStyle,
+  ): boolean {
     const anchor = createAnchor(range, this.options.root)
     if (!anchor) return false
 
@@ -613,9 +815,18 @@ export class HighLit {
         return fragmentAnchor ? [{ ...record, id: fragment.id, anchor: fragmentAnchor }] : []
       })
     })
-    this.records.push({ id, color, anchor, pressure: normalizePressure(pressure) })
+    this.records.push({ id, color, style, anchor, pressure: normalizePressure(pressure), createdAt: Date.now() })
     if (!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
-      this.revealStarts.set(id, performance.now())
+      // Count the full selection, including lines outside the viewport.
+      const lines = mergeLineRects(rangeClientRects(range, false))
+      if (lines.length > 0 && lines.length <= MAX_ANIMATED_LINES) {
+        const strokes = buildStrokeShapes(lines, id, pressure, style)
+        const duration = strokes.reduce((total, stroke, line) => {
+          const timing = lineTiming(stroke.right - stroke.left, `${id}:${line}`)
+          return total + timing.sweep + (line < strokes.length - 1 ? timing.pause : 0)
+        }, INK_TIMING.wetHold + INK_TIMING.dry)
+        if (duration <= MAX_ANIMATION_MS) this.revealStarts.set(id, performance.now())
+      }
     }
     this.write()
     return true
@@ -623,7 +834,7 @@ export class HighLit {
 
   private highlightPendingSelection(color: string): void {
     if (!this.pendingSelection) return
-    if (this.saveRange(this.pendingSelection, color, 0.5)) {
+    if (this.saveRange(this.pendingSelection, color, 0.5, uid(), this.selectedStyle)) {
       document.getSelection()?.removeAllRanges()
       this.hideSelectionMenu()
       this.render()
@@ -644,22 +855,24 @@ export class HighLit {
       const range = selection && selection.rangeCount > 0 && !selection.isCollapsed
         ? selection.getRangeAt(0)
         : undefined
-      if (range && this.options.root.contains(range.commonAncestorContainer)) this.showSelectionMenu(range)
+      if (range && isHighlightableRange(range, this.options.root)) this.showSelectionMenu(range)
       else this.hideSelectionMenu()
     }, delay)
   }
 
   private positionSelectionMenu(): void {
     if (!this.selectionMenu || !this.pendingSelection || this.selectionMenu.hidden) return
-    const rect = [...this.pendingSelection.getClientRects()].find(({ width, height }) => width > 0 && height > 0)
-    if (!rect) return this.hideSelectionMenu()
+    const rects = rangeClientRects(this.pendingSelection)
+    const first = rects[0]
+    const last = rects[rects.length - 1]
+    if (!first || !last) return this.hideSelectionMenu()
 
     const menuRect = this.selectionMenu.getBoundingClientRect()
-    const left = Math.min(window.innerWidth - menuRect.width / 2 - 8, Math.max(menuRect.width / 2 + 8, rect.left + rect.width / 2))
-    const above = rect.top - menuRect.height - 10
-    const below = above < 8
+    const below = last.bottom + menuRect.height + 18 <= window.innerHeight
+    const anchor = below ? last : first
+    const left = Math.min(window.innerWidth - menuRect.width / 2 - 8, Math.max(menuRect.width / 2 + 8, anchor.left + anchor.width / 2))
     this.selectionMenu.style.left = `${left}px`
-    this.selectionMenu.style.top = `${below ? rect.bottom + 10 : above}px`
+    this.selectionMenu.style.top = `${below ? last.bottom + 10 : Math.max(8, first.top - menuRect.height - 10)}px`
     this.selectionMenu.toggleAttribute('data-below', below)
   }
 
@@ -678,9 +891,13 @@ export class HighLit {
   }
 
   private onDocumentClick = (event: MouseEvent): void => {
-    if (this.active || event.composedPath().includes(this.host as EventTarget)) return
+    if (event.composedPath().includes(this.host as EventTarget)) return
+    if (!isHighlightableNode(event.target)) {
+      this.hideDelete()
+      return
+    }
     const found = [...this.rendered].reverse().find(({ range }) =>
-      [...range.getClientRects()].some((rect) =>
+      rangeClientRects(range).some((rect) =>
         event.clientX >= rect.left - 3 && event.clientX <= rect.right + 3 &&
         event.clientY >= rect.top - 3 && event.clientY <= rect.bottom + 3,
       ),
@@ -690,13 +907,11 @@ export class HighLit {
       return
     }
 
-    const rect = found.range.getBoundingClientRect()
+    const position = positionPopover(rangeClientRects(found.range), window.innerWidth, window.innerHeight)
     this.pendingDelete = found.record.id
     if (this.deleteButton) {
-      const left = Math.min(window.innerWidth - 42, Math.max(8, rect.left + rect.width / 2 - 17))
-      const above = rect.top - 42
-      this.deleteButton.style.left = `${left}px`
-      this.deleteButton.style.top = `${above >= 8 ? above : rect.bottom + 8}px`
+      this.deleteButton.style.left = `${position.left}px`
+      this.deleteButton.style.top = `${position.top}px`
       this.deleteButton.dataset.open = ''
     }
   }
@@ -708,7 +923,9 @@ export class HighLit {
   }
 
   private onStorage = (event: StorageEvent): void => {
-    if (event.key !== this.storageKey) return
+    if (this.customStorage) return
+    if (event.storageArea && event.storageArea !== window.localStorage) return
+    if (event.key !== null && event.key !== this.storageKey) return
     this.read()
     this.render()
   }
@@ -723,25 +940,39 @@ export class HighLit {
     this.frame = requestAnimationFrame(() => this.render())
   }
 
+  private onViewportChange = (): void => {
+    this.hideDelete()
+    this.scheduleRender()
+  }
+
   private render(): void {
-    if (!this.overlay) return
+    if (!this.mounted || !this.overlay) return
     this.overlay.replaceChildren()
     this.rendered = []
+    const modalOpen = [...document.querySelectorAll('dialog[open], [aria-modal="true"]')]
+      .some((element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden')
+    if (modalOpen) {
+      this.hideSelectionMenu()
+      this.hideDelete()
+      this.revealStarts.clear()
+      return
+    }
     const defs = document.createElementNS(SVG_NS, 'defs')
     const gradients = new Map<string, string>()
     const finishedReveals = new Set<string>()
     const now = performance.now()
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     let needsAnimationFrame = false
     this.overlay.append(defs)
 
-    const inkGradient = (color: string, pressureValue: number): string => {
+    const inkGradient = (color: string, pressureValue: number, inkDensity: number): string => {
       const pressure = normalizePressure(pressureValue)
-      const key = `${color}:${Math.round(pressure * 20)}`
+      const key = `${color}:${pressure}:${inkDensity}`
       const existing = gradients.get(key)
       if (existing) return existing
 
       const id = `highlit-ink-${hash(key).toString(36)}`
-      const density = 0.82 + pressure * 0.36
+      const density = (0.82 + pressure * 0.36) * inkDensity
       const gradient = document.createElementNS(SVG_NS, 'linearGradient')
       gradient.id = id
       gradient.setAttribute('x1', '0%')
@@ -757,7 +988,7 @@ export class HighLit {
         const stop = document.createElementNS(SVG_NS, 'stop')
         stop.setAttribute('offset', offset)
         stop.setAttribute('stop-color', color)
-        stop.setAttribute('stop-opacity', String(Number(opacity) * density))
+        stop.setAttribute('stop-opacity', String(Number(opacity) * density * INK_OPACITY))
         gradient.append(stop)
       })
       defs.append(gradient)
@@ -765,38 +996,63 @@ export class HighLit {
       return id
     }
 
-    const draw = (range: Range, color: string, id: string, pressureValue = 0.5): boolean => {
+    const draw = (
+      range: Range,
+      color: string,
+      id: string,
+      pressureValue = 0.5,
+      style: HighlighterStyle = 'chisel',
+    ): boolean => {
       const pressure = normalizePressure(pressureValue)
-      const rects = [...range.getClientRects()]
-        .filter(({ width, height }) => width > 0 && height > 0)
+      const rects = rangeClientRects(range)
         .map(({ x, y, width, height }) => ({ x, y, width, height }))
       if (!rects.length) return false
 
-      const strokes = buildStrokeShapes(rects, id, pressure)
+      const blendMode = markerBlendMode(range)
+      const strokes = buildStrokeShapes(rects, id, pressure, style)
       const revealStart = this.revealStarts.get(id)
-      const elapsed = revealStart === undefined ? Infinity : now - revealStart
+      const elapsed = reducedMotion || revealStart === undefined ? Infinity : now - revealStart
       let lineStart = 0
       let revealFinished = true
 
       for (const [line, stroke] of strokes.entries()) {
-        const lineDuration = Math.min(520, Math.max(180, (stroke.right - stroke.left) / 1.4))
+        const motionSeed = `${id}:${line}`
+        const timing = lineTiming(stroke.right - stroke.left, motionSeed)
+        const lineDuration = timing.sweep
         const progress = Math.min(1, Math.max(0, (elapsed - lineStart) / lineDuration))
-        const easedProgress = 1 - Math.pow(1 - progress, 3)
+        const revealProgress = humanRevealProgress(progress, motionSeed)
         const group = document.createElementNS(SVG_NS, 'g')
+        const dryProgress = Math.min(1, Math.max(0,
+          (elapsed - lineStart - lineDuration - INK_TIMING.wetHold) / INK_TIMING.dry,
+        ))
+        const inkDensity = 1 + WET_INK_BOOST * (1 - dryProgress * dryProgress * (3 - 2 * dryProgress))
+        // A stable, sub-pixel rise or fall across the line, never frame-to-frame wobble.
+        const drift = ((hash(`${motionSeed}:tilt`) % 101) / 100 - 0.5) * 1.2
+        const tilt = drift / Math.max(1, stroke.right - stroke.left)
+        group.setAttribute('transform', `matrix(1 ${tilt} 0 1 0 ${-tilt * (stroke.left + stroke.right) / 2})`)
+        if (revealStart !== undefined && dryProgress < 1) {
+          revealFinished = false
+          needsAnimationFrame = true
+        }
 
         if (revealStart !== undefined && progress < 1) {
           revealFinished = false
           needsAnimationFrame = true
           const clipId = `highlit-reveal-${hash(`${id}-${line}`).toString(36)}`
           const clip = document.createElementNS(SVG_NS, 'clipPath')
-          const reveal = document.createElementNS(SVG_NS, 'rect')
+          const reveal = document.createElementNS(SVG_NS, 'path')
+          const left = stroke.left - 3
+          const right = stroke.right + 3
+          const top = stroke.top - 3
+          const bottom = stroke.bottom + 3
+          const head = left + (right - left) * revealProgress
+          const slant = (3 + pressure * 3) * (hash(`${motionSeed}:slant`) % 2 ? 1 : -1)
+          const topHead = Math.min(right, Math.max(left, head + slant))
+          const bottomHead = Math.min(right, Math.max(left, head - slant))
           clip.id = clipId
           clip.dataset.highlitReveal = ''
           clip.setAttribute('clipPathUnits', 'userSpaceOnUse')
-          reveal.setAttribute('x', String(stroke.left - 3))
-          reveal.setAttribute('y', String(stroke.top - 3))
-          reveal.setAttribute('width', String((stroke.right - stroke.left + 6) * easedProgress))
-          reveal.setAttribute('height', String(stroke.bottom - stroke.top + 6))
+          reveal.setAttribute('d', `M ${left} ${top} H ${topHead} L ${bottomHead} ${bottom} H ${left} Z`)
           clip.append(reveal)
           defs.append(clip)
           group.setAttribute('clip-path', `url(#${clipId})`)
@@ -804,42 +1060,34 @@ export class HighLit {
 
         const path = document.createElementNS(SVG_NS, 'path')
         path.setAttribute('d', stroke.d)
-        path.setAttribute('fill', `url(#${inkGradient(color, pressure)})`)
-        path.style.mixBlendMode = 'multiply'
+        path.setAttribute('fill', `url(#${inkGradient(color, pressure, inkDensity)})`)
+        path.style.mixBlendMode = blendMode
         group.append(path)
 
         const startDeposit = document.createElementNS(SVG_NS, 'path')
         startDeposit.setAttribute('d', stroke.startDeposit)
         startDeposit.setAttribute('fill', color)
-        startDeposit.setAttribute('fill-opacity', String(0.1 + pressure * 0.08))
-        startDeposit.style.mixBlendMode = 'multiply'
+        startDeposit.setAttribute('fill-opacity', String((0.1 + pressure * 0.08) * INK_OPACITY * inkDensity))
+        startDeposit.style.mixBlendMode = blendMode
         group.append(startDeposit)
 
         const endDeposit = document.createElementNS(SVG_NS, 'path')
         endDeposit.setAttribute('d', stroke.endDeposit)
         endDeposit.setAttribute('fill', color)
-        endDeposit.setAttribute('fill-opacity', String(0.045 + pressure * 0.04))
-        endDeposit.style.mixBlendMode = 'multiply'
+        endDeposit.setAttribute('fill-opacity', String((0.045 + pressure * 0.04) * INK_OPACITY * inkDensity))
+        endDeposit.style.mixBlendMode = blendMode
         group.append(endDeposit)
 
-        const grain = document.createElementNS(SVG_NS, 'path')
-        grain.setAttribute('d', stroke.grain)
-        grain.setAttribute('fill', 'none')
-        grain.setAttribute('stroke', color)
-        grain.setAttribute('stroke-opacity', String(0.07 + pressure * 0.04))
-        grain.setAttribute('stroke-width', String(stroke.grainWidth))
-        grain.setAttribute('stroke-linecap', 'round')
-        grain.style.mixBlendMode = 'multiply'
-        group.append(grain)
         this.overlay!.append(group)
-        lineStart += lineDuration + 45
+        lineStart += lineDuration + timing.pause
       }
       if (revealStart !== undefined && revealFinished) finishedReveals.add(id)
       return true
     }
 
+    const textIndex = this.records.length ? createTextIndex(this.options.root) : undefined
     for (const record of this.records) {
-      const range = resolveAnchor(record.anchor, this.options.root)
+      const range = resolveAnchor(record.anchor, this.options.root, textIndex)
       if (!range) {
         this.revealStarts.delete(record.id)
         continue
@@ -847,12 +1095,18 @@ export class HighLit {
       const visibleRanges = this.previewRange
         ? subtractRange(range, this.previewRange, record.id)
         : [{ range, id: record.id }]
-      visibleRanges.forEach((fragment) => draw(fragment.range, record.color, fragment.id, record.pressure))
+      visibleRanges.forEach((fragment) => draw(
+        fragment.range,
+        record.color,
+        fragment.id,
+        record.pressure,
+        record.style ?? 'chisel',
+      ))
       this.rendered.push({ record, range })
     }
 
     if (this.previewRange && this.previewId) {
-      draw(this.previewRange, this.selectedColor, this.previewId, this.currentPressure())
+      draw(this.previewRange, this.selectedColor, this.previewId, this.currentPressure(), this.selectedStyle)
     }
     finishedReveals.forEach((id) => this.revealStarts.delete(id))
     this.positionSelectionMenu()

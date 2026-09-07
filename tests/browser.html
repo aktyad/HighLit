@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HighLit browser checks</title>
+<style>
+  body { font: 16px/1.5 system-ui; margin: 24px; }
+  #stage { min-height: 160px; position: relative; margin-top: 24px; }
+  #stage p { font: 22px/1.7 Georgia; }
+  button, input { font: inherit; padding: 8px; }
+  .cover { position: fixed; z-index: 20; background: white; }
+  .pass { color: #146534; } .fail { color: #b91c1c; }
+</style>
+<header data-highlit-ignore>
+  <h1>HighLit browser checks</h1>
+  <button id="run">Run browser checks</button>
+  <p id="status" role="status">Ready. Uses temporary in-memory highlights.</p>
+</header>
+<div id="stage"></div>
+<ol id="results" data-highlit-ignore></ol>
+<script type="module">
+  import { createHighlit } from '../dist/index.js'
+  const stage = document.querySelector('#stage')
+  const results = document.querySelector('#results')
+  const status = document.querySelector('#status')
+  const pause = (ms = 180) => new Promise(resolve => setTimeout(resolve, ms))
+  const assert = (ok, message) => { if (!ok) throw Error(message) }
+  const ink = () => document.querySelector('svg[data-highlit-ui] > g')
+  const ui = () => document.querySelector('div[data-highlit-ui]')?.shadowRoot
+  const select = element => {
+    getSelection().removeAllRanges()
+    const range = document.createRange()
+    range.selectNodeContents(element)
+    getSelection().addRange(range)
+    document.dispatchEvent(new Event('selectionchange'))
+    element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }))
+  }
+  document.querySelector('#run').onclick = async () => {
+    document.querySelector('#run').disabled = true
+    results.replaceChildren()
+    let passed = 0, failed = 0
+    const check = async (name, test) => {
+      stage.innerHTML = '<p id="text">Keep these useful words.</p>'
+      let saved = null
+      const options = { root: stage, storage: { getItem: () => saved, setItem: (_, value) => { saved = value } } }
+      const highlit = createHighlit(options)
+      let extra
+      try {
+        await test(highlit, options, element => { extra = element })
+        passed++
+        const li = results.appendChild(document.createElement('li'))
+        li.className = 'pass'; li.textContent = `PASS — ${name}`
+      } catch (error) {
+        failed++
+        const li = results.appendChild(document.createElement('li'))
+        li.className = 'fail'; li.textContent = `FAIL — ${name}: ${error.message}`
+      } finally {
+        highlit.destroy(); extra?.remove(); getSelection().removeAllRanges()
+      }
+    }
+    status.textContent = 'Running…'
+    await check('Three wrapped lines animate immediately', async h => {
+      stage.innerHTML = '<p>First selected line<br>Second selected line<br>Third selected line</p>'
+      select(stage.querySelector('p')); await pause()
+      ui().querySelector('.selection-swatch').click()
+      assert(document.querySelectorAll('clipPath[data-highlit-reveal]').length === 3,
+        `Expected 3 animated lines, got ${document.querySelectorAll('clipPath[data-highlit-reveal]').length}`)
+    })
+    await check('Native selection, colour choice, and restoring saved ink', async (h, options) => {
+      select(stage.querySelector('p')); await pause()
+      assert(!ui().querySelector('.selection-menu').hidden, 'Picker missing')
+      ui().querySelectorAll('button.selection-swatch')[3].click(); await pause(1900)
+      assert(ink(), 'Ink missing')
+      h.destroy()
+      const restored = createHighlit(options)
+      try { assert(ink(), 'Saved ink did not restore') } finally { restored.destroy() }
+    })
+    for (const markup of ['<input value="Input text">', '<textarea>Editor text</textarea>',
+      '<div contenteditable>Editable text</div>', '<button>Button text</button>', '<a href="#">Link text</a>']) {
+      await check(`Excludes ${markup.match(/\w+/)[0]}`, async h => {
+        stage.insertAdjacentHTML('beforeend', markup)
+        const target = stage.lastElementChild
+        target.focus(); select(target); await pause()
+        assert(ui().querySelector('.selection-menu').hidden && !ink(), 'Interactive content highlighted')
+      })
+    }
+    await check('Fixed overlay hides ink and restores it when removed', async (h, _, keep) => {
+      h.enable(); select(stage.querySelector('p')); await pause()
+      assert(ink(), 'Initial ink missing')
+      const rect = stage.querySelector('p').getBoundingClientRect()
+      const cover = document.createElement('aside'); keep(cover)
+      cover.className = 'cover'; cover.textContent = 'Website overlay'
+      Object.assign(cover.style, { left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` })
+      document.body.append(cover); await pause()
+      assert(!ink(), 'Ink remained over overlay')
+      cover.remove(); await pause(); assert(ink(), 'Ink did not return')
+    })
+    await check('Native modal suppresses highlights without deleting them', async (h, _, keep) => {
+      h.enable(); select(stage.querySelector('p')); await pause()
+      const dialog = document.createElement('dialog'); keep(dialog)
+      dialog.textContent = 'Modal content'; document.body.append(dialog); dialog.showModal(); await pause()
+      assert(!ink(), 'Ink remained with modal open')
+      dialog.close(); await pause(); assert(ink(), 'Ink did not return')
+    })
+    await check('Popover content is excluded', async (h, _, keep) => {
+      const popover = document.createElement('div'); keep(popover)
+      popover.setAttribute('popover', 'manual'); popover.textContent = 'Popover text'
+      stage.append(popover); popover.showPopover(); select(popover); await pause()
+      assert(ui().querySelector('.selection-menu').hidden && !ink(), 'Popover was highlighted')
+    })
+    await check('Clipped scroll-container text does not leak outside its bounds', async h => {
+      stage.innerHTML = '<div style="height:45px;overflow:auto"><p>First line<br>Second line<br>Third line<br>Fourth line</p></div>'
+      h.enable(); select(stage.querySelector('p')); await pause(1900)
+      const box = stage.firstElementChild.getBoundingClientRect()
+      for (const group of document.querySelectorAll('svg[data-highlit-ui] > g')) {
+        const rect = group.getBoundingClientRect()
+        assert(rect.top >= box.top - 4 && rect.bottom <= box.bottom + 4, 'Ink outside scroll clip')
+      }
+      stage.firstElementChild.scrollTop = 60; await pause()
+      assert(ink(), 'Visible scrolled text has no ink')
+    })
+    await check('Destroy removes controls, ink, and delayed work', async h => {
+      h.enable(); select(stage.querySelector('p')); h.destroy(); await pause()
+      assert(!document.querySelector('[data-highlit-ui]'), 'UI leaked after destroy')
+    })
+    stage.replaceChildren()
+    status.textContent = `${passed} passed, ${failed} failed`
+    document.querySelector('#run').disabled = false
+  }
+</script>

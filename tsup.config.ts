@@ -5,9 +5,9 @@ export default defineConfig([
     entry: ['src/index.ts', 'src/auto.ts'],
     format: ['esm', 'cjs'],
     dts: true,
-    sourcemap: true,
-    clean: true,
-    loader: { '.svg': 'dataurl' },
+    minify: true,
+    clean: false,
+    loader: { '.svg': 'dataurl', '.png': 'dataurl' },
   },
   {
     entry: { auto: 'src/auto.ts' },
@@ -15,7 +15,7 @@ export default defineConfig([
     globalName: 'HighLit',
     minify: true,
     clean: false,
-    loader: { '.svg': 'dataurl' },
+    loader: { '.svg': 'dataurl', '.png': 'dataurl' },
     outExtension: () => ({ js: '.global.js' }),
   },
 ])

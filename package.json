@@ -2,6 +2,12 @@
   "name": "highlit-marker",
   "version": "0.1.0",
   "description": "A tiny, human-feeling text highlighter for any web page.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aktyad/HighLit.git"
+  },
+  "homepage": "https://github.com/aktyad/HighLit#readme",
+  "bugs": { "url": "https://github.com/aktyad/HighLit/issues" },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -23,6 +29,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "sideEffects": [
@@ -30,7 +37,9 @@
     "./dist/auto.cjs"
   ],
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsup",
+    "prepack": "npm run typecheck && npm test && npm run build && node scripts/check-package.mjs",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

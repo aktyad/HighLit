@@ -12,7 +12,41 @@ interface TextEntry {
   end: number
 }
 
-const EXCLUDED = 'script, style, noscript, textarea, select, option, [data-highlit-ui]'
+const EXCLUDED = [
+  'script', 'style', 'noscript',
+  'input', 'textarea', 'select', 'option', 'button', 'summary',
+  'a[href]', 'label', 'dialog', '[popover]', '[inert]', '[hidden]', '[aria-hidden="true"]',
+  '[role="dialog"]', '[role="alertdialog"]', '[role="menu"]', '[role="listbox"]',
+  '[role="slider"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]',
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="textbox"]', '[role="searchbox"]', '[role="combobox"]', '[role="spinbutton"]', '[role="button"]',
+  '[data-highlit-ignore]', '[data-highlit-ui]',
+].join(', ')
+
+export function isHighlightableRange(range: Range, root: HTMLElement): boolean {
+  if (range.collapsed || !range.toString().trim() || !root.contains(range.commonAncestorContainer)) return false
+  const common = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer as Element
+    : range.commonAncestorContainer.parentElement
+  if (!common || common.closest(EXCLUDED)) return false
+
+  return ![...common.querySelectorAll(EXCLUDED)].some((element) => {
+    try {
+      return range.intersectsNode(element)
+    } catch {
+      return false
+    }
+  })
+}
+
+export function isHighlightableNode(node: EventTarget | null): boolean {
+  const element = node instanceof Element
+    ? node
+    : node instanceof Node
+      ? node.parentElement
+      : null
+  return !element?.closest(EXCLUDED)
+}
 
 function textEntries(root: HTMLElement): TextEntry[] {
   const view = root.ownerDocument.defaultView
@@ -43,7 +77,7 @@ function textEntries(root: HTMLElement): TextEntry[] {
 }
 
 export function createAnchor(range: Range, root: HTMLElement): TextAnchor | null {
-  if (range.collapsed || !root.contains(range.commonAncestorContainer)) return null
+  if (!isHighlightableRange(range, root)) return null
 
   const entries = textEntries(root)
   const touched = entries.filter(({ node }) => {
@@ -101,9 +135,14 @@ function rangeAt(root: HTMLElement, start: number, end: number, entries: TextEnt
   return range
 }
 
-export function resolveAnchor(anchor: TextAnchor, root: HTMLElement): Range | null {
+export function createTextIndex(root: HTMLElement) {
   const entries = textEntries(root)
   const text = entries.map(({ node }) => node.data).join('')
+  return { entries, text }
+}
+
+export function resolveAnchor(anchor: TextAnchor, root: HTMLElement, indexData = createTextIndex(root)): Range | null {
+  const { entries, text } = indexData
 
   if (text.slice(anchor.start, anchor.end) === anchor.exact) {
     return rangeAt(root, anchor.start, anchor.end, entries)

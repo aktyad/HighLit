@@ -3,7 +3,7 @@ import { createHighlit, HighLit } from './index'
 let instance: HighLit | undefined
 
 export function start(): HighLit {
-  return instance ??= createHighlit()
+  return (instance ??= createHighlit()).mount()
 }
 
 if (typeof document !== 'undefined') {
